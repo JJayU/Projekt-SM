@@ -60,18 +60,24 @@ char text[] = "12345";
 int sterowanie = 0;
 float pid_output;
 
-float Kp = 636.7;
-float Ki = 1;
+float Kp = 200;
+float Ki = 5;
 float Kd = 1;
-float dt = 1;
+float dt = 0.1;
 float previous_error = 0;
 float previous_integral = 0;
 
-float target_temperature = 0;
+float target_temperature;
 
-float wzmocnienie_sterowania = 50;
+int pid_output_int;
 
 struct lcd_disp disp;
+
+int impulsy;
+int target_enkoder;
+
+char rx_buffer[2];
+int target_uart = 25;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,24 +92,30 @@ float calculate_discrete_pid(float setpoint, float measured)
 {
 	float u=0, P, I, D, error, integral, derivative;
 
+	// Uchyb
 	error = setpoint-measured;
 
-	//proportional part
+	// Czlon proporcjonalny
 	P = Kp * error;
 
-	//integral part
-	integral = previous_integral + (error+previous_error) ; //numerical integrator without anti-windup
+	// Czlon calkujacy
+	integral = previous_integral + (error+previous_error) ;
+	if(integral < 0)
+		integral = 0;
+	if(integral > 2000)
+		integral = 2000;
 	previous_integral = integral;
 	I = Ki*integral*(dt/2.0);
 
-	//derivative part
-	derivative = (error - previous_error)/dt; //numerical derivative without filter
+	// Czlon rozniczkujacy
+	derivative = (error - previous_error)/dt;
 	previous_error = error;
 	D = Kd*derivative;
 
-	//sum of all parts
-	u = P * (1 + I + D); //without saturation
+	// Suma czlonow
+	u = P * (1.0 + I + D);
 
+	// Ograniczenie sygnalu sterujacego
 	if(u>2000)
 		return 2000;
 	else if(u<0)
@@ -147,24 +159,31 @@ int main(void)
   MX_TIM4_Init();
   MX_I2C2_Init();
   MX_TIM1_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+
+  // Inicjalizacja czujnika BMP280
   BMP280_Init(&hi2c2, BMP280_TEMPERATURE_16BIT, BMP280_STANDARD, BMP280_FORCEDMODE);
+
+  // Inicjalizacja timerow oraz wyjscia PWM
   HAL_TIM_Base_Start(&htim4);
+  HAL_TIM_Base_Start_IT(&htim3);
   HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
 
-  //Obsługa lcd
+  // Obsluga LCD
   disp.addr = (0x27 << 1);
   disp.bl = true;
   lcd_init(&disp);
-  //sprintf((char *)disp.f_line, "test");
-  //lcd_display(&disp);
 
-  //Enkoder
+  // Enkoder - inicjalizacja
   HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);
+  __HAL_TIM_SET_COUNTER(&htim1, 1000);
 
-  //Zmienna zatwierdzajaca
+  // Zmienna zatwierdzajaca od przycisku
   int x = 1;
-  float impulsy = 0.0;
+
+  // Inicjalizacja przerwania do odczytu danych z UART
+  HAL_UART_Receive_IT(&huart3, rx_buffer, 2);
 
   /* USER CODE END 2 */
 
@@ -175,37 +194,41 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	// Odczyt temperatury z czujnika
 	BMP280_ReadTemperatureAndPressure(&temperature, &pressure);
-	pid_output = calculate_discrete_pid(target_temperature, temperature);
-	int pid_output_int = pid_output;
+
+	// Wysylanie aktualnej temperatury przez UART
 	sprintf((char*)text, "%.2f, ", temperature);
 	HAL_UART_Transmit(&huart3, (uint8_t*)text, strlen(text), 1000);
-	HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1,DAC_ALIGN_12B_R, pid_output_int);
-	HAL_Delay(1000);
-	target_temperature = 25;
 
-	//moja czesc
+	// Obsluga enkodera
 	impulsy = __HAL_TIM_GET_COUNTER(&htim1);
+	target_enkoder = (impulsy/2) - 500 + 25;
+
+	// Wyswietlanie aktualnej temperatury
 	sprintf((char*)disp.s_line, "Aktualna = %.2f", temperature);
 
+	// Obsluga przycisku i zmiana trybu dzialania
 	if(HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin))
 		x = x+1;
 
 	switch (x){
 		case 1:
-			target_temperature = 30;
-			sprintf((char*)disp.f_line, "Zadana = 30");
+			target_temperature = target_uart;
+			sprintf((char*)disp.f_line, "Zadana (PC) = %u", target_uart);
 			break;
 		case 2:
-			target_temperature = 27.0 + (impulsy/2.0);
-			sprintf((char*)disp.f_line, "Zadana =%.0f", 27+(impulsy/2.0));
+			target_temperature = target_enkoder;
+			sprintf((char*)disp.f_line, "Zadana (EN) = %u", target_enkoder);
 			break;
 		case 3:
 			x = 1;
 			break;
 	}
 
+	// Wyswietlanie na LCD
 	lcd_display(&disp);
+	HAL_Delay(200);
   }
   /* USER CODE END 3 */
 }
@@ -260,7 +283,32 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+// Przerwanie co 100ms odpowiedzialne za policzenie sygnalu sterujacego
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	if(htim == &htim3)
+	{
+		// Migajaca dioda sygnalizujaca dzialanie
+		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
 
+		// Wywolanie funkcji PID
+		pid_output = calculate_discrete_pid(target_temperature, temperature);
+		pid_output_int = pid_output;
+
+		// Ustawienie obliczonej wartosci na wyjsciu PWM
+		HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1,DAC_ALIGN_12B_R, pid_output_int);
+	}
+}
+
+// Przerwanie od odbioru danych z UART
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	// Restart przerwania
+	HAL_UART_Receive_IT(&huart3, rx_buffer, 2);
+
+	// Konwersja na Int
+	target_uart = atoi(rx_buffer);
+}
 /* USER CODE END 4 */
 
 /**
